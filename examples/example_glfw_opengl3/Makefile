@@ -14,16 +14,18 @@
 #CXX = g++
 #CXX = clang++
 
-EXE = example_glfw_opengl3
+EXE = llm_UI
 IMGUI_DIR = ../..
-SOURCES = main.cpp
+SOURCES = llm.cpp
 SOURCES += $(IMGUI_DIR)/imgui.cpp $(IMGUI_DIR)/imgui_demo.cpp $(IMGUI_DIR)/imgui_draw.cpp $(IMGUI_DIR)/imgui_tables.cpp $(IMGUI_DIR)/imgui_widgets.cpp
 SOURCES += $(IMGUI_DIR)/backends/imgui_impl_glfw.cpp $(IMGUI_DIR)/backends/imgui_impl_opengl3.cpp
+SOURCES += ../libs/glad/src/glad.c
 OBJS = $(addsuffix .o, $(basename $(notdir $(SOURCES))))
 UNAME_S := $(shell uname -s)
 LINUX_GL_LIBS = -lGL
 
 CXXFLAGS = -std=c++11 -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
+CXXFLAGS += -I../libs/glad/include
 CXXFLAGS += -g -Wall -Wformat
 LIBS =
 
@@ -70,6 +72,12 @@ endif
 ## BUILD RULES
 ##---------------------------------------------------------------------
 
+all: $(EXE)
+	@echo Build complete for $(ECHO_MESSAGE)
+
+$(EXE): $(OBJS)
+	$(CXX) -o $@ $^ $(CXXFLAGS) $(LIBS)
+
 %.o:%.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
@@ -79,11 +87,8 @@ endif
 %.o:$(IMGUI_DIR)/backends/%.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-all: $(EXE)
-	@echo Build complete for $(ECHO_MESSAGE)
-
-$(EXE): $(OBJS)
-	$(CXX) -o $@ $^ $(CXXFLAGS) $(LIBS)
+glad.o: ../libs/glad/src/glad.c
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
 	rm -f $(EXE) $(OBJS)
