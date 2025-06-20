@@ -36,10 +36,18 @@ static void glfw_error_callback(int error, const char* description)
 // --- Application State Management ---
 enum class RequestStatus { IDLE, SENDING };
 struct AppState {
+    // 原有状态
     char prompt_buffer[1024] = "Make the cube twice as tall.";
     RequestStatus status = RequestStatus::IDLE;
     std::vector<std::string> log_messages;
     double request_sent_time = 0.0;
+
+    // --- 新增状态用于LLM回复窗口 ---
+    bool show_llm_response_window = true;  // 控制窗口是否显示
+    bool is_generating_response = false;    // 是否处于“打字机”生成效果状态
+    std::string llm_response_full_text;     // 存储从LLM收到的完整回复
+    size_t typewriter_char_index = 0;       // “打字机”效果当前显示的字符索引
+    double typewriter_start_time = 0.0;     // “打字机”效果的开始时间
 };
 
 // --- 3D Scene Data ---
@@ -247,8 +255,7 @@ namespace UI {
 
 bool PillButton(const char* label, const ImVec2& size_arg) {
     ImGuiWindow* window = ImGui::GetCurrentWindow();
-    if (window->SkipItems)
-        return false;
+    if (window->SkipItems) return false;
 
     ImGuiContext& g = *GImGui;
     const ImGuiStyle& style = g.Style;
@@ -260,8 +267,7 @@ bool PillButton(const char* label, const ImVec2& size_arg) {
 
     const ImRect bb(pos, ImVec2(pos.x + size.x, pos.y + size.y));
     ImGui::ItemSize(size, style.FramePadding.y);
-    if (!ImGui::ItemAdd(bb, id))
-        return false;
+    if (!ImGui::ItemAdd(bb, id)) return false;
 
     bool hovered, held;
     bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held, 0);
@@ -275,6 +281,7 @@ bool PillButton(const char* label, const ImVec2& size_arg) {
     ImVec4 bg_color_v4 = ImLerp(col_bg_base, col_bg_hover, *anim_factor);
 
     draw_list->AddRectFilled(bb.Min, bb.Max, ImGui::GetColorU32(bg_color_v4), size.y / 2.0f);
+    
     ImVec2 text_clip_min(bb.Min.x + style.FramePadding.x, bb.Min.y + style.FramePadding.y);
     ImVec2 text_clip_max(bb.Max.x - style.FramePadding.x, bb.Max.y - style.FramePadding.y);
     ImGui::RenderTextClipped(text_clip_min, text_clip_max, label, NULL, &label_size, style.ButtonTextAlign, &bb);
@@ -284,133 +291,215 @@ bool PillButton(const char* label, const ImVec2& size_arg) {
     return pressed;
 }
 
-// A custom button with a gradient background and hover animation.
-bool GradientButton(const char* label, const ImVec2& size = ImVec2(0, 0)) {
-    ImGuiWindow* window = ImGui::GetCurrentWindow();
-    if (window->SkipItems)
-        return false;
-
+void ActionInputBox(AppState& app_state) {
     ImGuiContext& g = *GImGui;
     const ImGuiStyle& style = g.Style;
-    const ImGuiID id = window->GetID(label);
-    const ImVec2 label_size = ImGui::CalcTextSize(label, NULL, true);
 
-    ImVec2 pos = window->DC.CursorPos;
-    ImVec2 button_size = ImGui::CalcItemSize(size, label_size.x + style.FramePadding.x * 2.0f, label_size.y + style.FramePadding.y * 2.0f);
+    // --- 基本布局参数 ---
+    const float container_width = ImGui::GetContentRegionAvail().x;
+    const float internal_padding = 15.0f;
+    const float button_width = 110.0f;
+    const float button_height = 35.0f;
+    
+    // --- 定义最小/最大高度与动态高度计算 (用于外部容器) ---
+    const float MIN_HEIGHT = 55.0f;
+    const float MAX_HEIGHT = 200.0f;
 
-    const ImRect bb(pos, ImVec2(pos.x + button_size.x, pos.y + button_size.y));
-    ImGui::ItemSize(bb, style.FramePadding.y);
-    if (!ImGui::ItemAdd(bb, id))
-        return false;
+    const float text_input_width = container_width - button_width - internal_padding * 3.0f;
+    std::string calc_buffer = std::string(app_state.prompt_buffer) + " ";
+    float text_height = ImGui::CalcTextSize(calc_buffer.c_str(), NULL, false, text_input_width).y;
+    // 为容器的期望高度增加一些垂直内边距
+    float desired_height = text_height + internal_padding * 2.0f + style.FramePadding.y * 2.0f;
+    
+    float target_height = ImClamp(desired_height, MIN_HEIGHT, MAX_HEIGHT);
 
-    bool hovered, held;
-    bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held, 0);
+    // --- 外部容器的动画高度 ---
+    const ImGuiID height_id = ImGui::GetCurrentWindow()->GetID("##action_input_height");
+    float* animated_height = ImGui::GetStateStorage()->GetFloatRef(height_id, MIN_HEIGHT);
+    *animated_height = ImLerp(*animated_height, target_height, g.IO.DeltaTime * 10.0f);
+    const float container_height = *animated_height;
 
-    // --- Animation Logic ---
-    // Get a persistent float value for the animation factor
-    float* anim_factor = ImGui::GetStateStorage()->GetFloatRef(id, 0.0f);
-    const float anim_speed = 0.08f;
-    if (hovered) {
-        *anim_factor = ImMin(1.0f, *anim_factor + anim_speed);
+    // --- 绘制与样式 (外部容器) ---
+    const float rounding = 28.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, rounding);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(255, 255, 255, 255));
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(210, 210, 210, 255));
+
+    ImDrawList* parent_draw_list = ImGui::GetWindowDrawList();
+    const ImVec2 container_pos = ImGui::GetCursorScreenPos();
+    parent_draw_list->AddRect(container_pos, ImVec2(container_pos.x + container_width, container_pos.y + container_height), IM_COL32(0, 0, 0, 30), rounding, 0, 5.0f);
+    
+    // 外部容器永远不允许滚动
+    ImGuiWindowFlags outer_child_flags = ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoScrollbar;
+    
+    ImGui::BeginChild("ActionInputContainer", ImVec2(container_width, container_height), false, outer_child_flags);
+
+    float text_area_height;
+    if (desired_height <= MIN_HEIGHT) {
+        text_area_height = g.FontSize + style.FramePadding.y * 2.0f;
+        ImGui::SetCursorPosY((container_height - text_area_height) / 2.0f);
     } else {
-        *anim_factor = ImMax(0.0f, *anim_factor - anim_speed);
-    }
-    // Ease-out function for a smoother effect
-    float eased_factor = 1.0f - (1.0f - *anim_factor) * (1.0f - *anim_factor);
-
-    // --- Drawing Logic ---
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    
-    // Base colors from the current style
-    const ImVec4& col_bg_base = style.Colors[ImGuiCol_Button];
-    const ImVec4& col_bg_hover = style.Colors[ImGuiCol_ButtonHovered];
-    // CORRECTED: Manual linear interpolation for colors
-    auto lerp = [](const ImVec4& a, const ImVec4& b, float t) {
-        return ImVec4(a.x + (b.x - a.x) * t,
-                      a.y + (b.y - a.y) * t,
-                      a.z + (b.z - a.z) * t,
-                      a.w + (b.w - a.w) * t);
-    };
-
-    ImVec4 bg_color_v4 = lerp(col_bg_base, col_bg_hover, eased_factor);
-    ImU32 bg_color = ImGui::ColorConvertFloat4ToU32(bg_color_v4);
-    
-    // Draw the rounded rectangle
-    // The key change is here: use AddRectFilled and a high rounding value
-    draw_list->AddRectFilled(bb.Min, bb.Max, bg_color, button_size.y / 2.0f);
-
-    // Draw text centered
-    ImVec2 text_pos = ImVec2(
-        bb.Min.x + (button_size.x - label_size.x) / 2.0f,
-        bb.Min.y + (button_size.y - label_size.y) / 2.0f
-    );
-    draw_list->AddText(text_pos, ImGui::GetColorU32(ImGuiCol_Text), label, label + strlen(label));
-    
-    // NEW: Add the tooltip on hover, just like Google AI Studio
-    if (hovered) {
-        ImGui::SetTooltip("Run Prompt");
+        text_area_height = container_height - internal_padding;
+        ImGui::SetCursorPosY(internal_padding / 2.0f);
     }
 
-    return pressed;
-}
+    ImGui::SetCursorPosX(internal_padding);
 
-void ActionInputBox(AppState& app_state) {
-    ImGuiWindow* window = ImGui::GetCurrentWindow();
-    const ImGuiStyle& style = ImGui::GetStyle();
-    const float input_box_height = 50.0f; // Taller for a better feel
-    
-    ImVec2 pos = window->DC.CursorPos;
-    pos.x = style.WindowPadding.x;
-    pos.y = ImGui::GetWindowHeight() - input_box_height - style.WindowPadding.y * 2.0f;
-    const float width = ImGui::GetWindowWidth() - style.WindowPadding.x * 2.0f;
-
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-
-    // 1. Draw the drop shadow
-    const ImU32 shadow_color = IM_COL32(0, 0, 0, 50);
-    const float shadow_offset = 2.0f;
-    const float shadow_blur = 8.0f;
-    draw_list->AddRect(ImVec2(pos.x - shadow_offset, pos.y - shadow_offset), 
-                       ImVec2(pos.x + width + shadow_offset, pos.y + input_box_height + shadow_offset), 
-                       shadow_color, input_box_height / 2.0f, ImDrawFlags_None, shadow_blur);
-
-    // 2. Draw the main container
-    const ImU32 bg_color = IM_COL32(255, 255, 255, 255);
-    const ImU32 border_color = IM_COL32(200, 200, 200, 255);
-    draw_list->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + input_box_height), bg_color, input_box_height / 2.0f);
-    draw_list->AddRect(pos, ImVec2(pos.x + width, pos.y + input_box_height), border_color, input_box_height / 2.0f);
-
-    // 3. Position and draw the widgets inside
-    const float button_width = 100.0f;
-    const float internal_padding = 10.0f;
-    const float text_input_width = width - button_width - internal_padding * 3.0f;
-
-    // Position the text input
-    ImGui::SetCursorScreenPos(ImVec2(pos.x + internal_padding, pos.y + (input_box_height - ImGui::GetTextLineHeightWithSpacing()) / 2.0f));
-    ImGui::PushItemWidth(text_input_width);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0,0,0,0)); // Transparent background
-    ImGui::InputText("##Prompt", app_state.prompt_buffer, sizeof(app_state.prompt_buffer));
-    ImGui::PopStyleColor();
+    // --- 1. 左侧的、可滚动的、隐形的文本区域 ---
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0,0,0,0)); // 透明背景
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f); // 无边框
+    // 这个内部子窗口可以滚动
+    ImGui::BeginChild("TextInputScrollArea", ImVec2(text_input_width, text_area_height), false, ImGuiWindowFlags_NoMove);
+    {
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32_BLACK_TRANS); // 输入框本身透明
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f)); // 输入框无内边距
+        
+        // InputTextMultiline填满这个可滚动的子窗口
+        ImGui::InputTextMultiline("##Prompt", app_state.prompt_buffer, sizeof(app_state.prompt_buffer), 
+                                  ImGui::GetContentRegionAvail(), // 自动填满
+                                  ImGuiInputTextFlags_None);
+                                  
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndChild();
     ImGui::PopStyleVar();
-    ImGui::PopItemWidth();
+    ImGui::PopStyleColor();
 
-    // Position the button
-    ImGui::SetCursorScreenPos(ImVec2(pos.x + width - button_width - internal_padding, pos.y + (input_box_height - 30.0f) / 2.0f));
+
+    // --- 2. 右下角的固定按钮 ---
+    float button_y_pos;
+    if (desired_height <= MIN_HEIGHT) {
+        button_y_pos = (container_height - button_height) / 2.0f;
+    } else {
+        button_y_pos = container_height - button_height - internal_padding;
+    }
+    ImGui::SetCursorPos(ImVec2(container_width - button_width - internal_padding, button_y_pos));
     
     if (app_state.status == RequestStatus::SENDING) {
         ImGui::BeginDisabled();
-        PillButton(ICON_FA_PAPER_PLANE " Run", ImVec2(button_width, 30.0f));
+        PillButton(ICON_FA_PAPER_PLANE " Run", ImVec2(button_width, button_height));
         ImGui::EndDisabled();
     } else {
-        if (PillButton(ICON_FA_PAPER_PLANE " Run", ImVec2(button_width, 30.0f))) {
-             app_state.status = RequestStatus::SENDING;
-             app_state.request_sent_time = glfwGetTime();
-             app_state.log_messages.push_back(std::string(ICON_FA_ARROW_UP) + " [Info] Send Prompt: " + std::string(app_state.prompt_buffer));
+        if (PillButton(ICON_FA_PAPER_PLANE " Run", ImVec2(button_width, button_height))) {
+            app_state.status = RequestStatus::SENDING;
+            app_state.request_sent_time = glfwGetTime();
+            app_state.log_messages.push_back(std::string(ICON_FA_ARROW_UP) + " [Info] Send Command: " + std::string(app_state.prompt_buffer));
+
+            app_state.llm_response_full_text.clear(); 
         }
     }
+
+    ImGui::EndChild(); // 结束 ActionInputContainer
+    ImGui::PopStyleColor(2); // 弹出 ChildBg 和 Border 的颜色
+    ImGui::PopStyleVar(2);   // 弹出 ChildRounding 和 ChildBorderSize 的样式
 }
 
+void GeminiLoadingSpinner(const char* id, float radius, float thickness, const ImU32& color) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return;
+
+    ImGuiContext& g = *GImGui;
+    const ImGuiID im_id = window->GetID(id);
+    const ImVec2 pos = window->DC.CursorPos;
+
+    // 预留绘制空间
+    ImGui::InvisibleButton(id, ImVec2(radius * 2, radius * 2));
+    const ImVec2 center = ImVec2(pos.x + radius, pos.y + radius);
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+    float time = (float)g.Time;
+    
+    // 1. 绘制旋转的圆弧 (这部分保持不变)
+    const float arc_start_angle_1 = time * 2.8f;
+    const float arc_end_angle_1 = arc_start_angle_1 + IM_PI * 0.7f;
+    draw_list->PathClear();
+    draw_list->PathArcTo(center, radius, arc_start_angle_1, arc_end_angle_1, 32);
+    draw_list->PathStroke(color, 0, thickness);
+
+    const float arc_start_angle_2 = time * 2.8f + IM_PI;
+    const float arc_end_angle_2 = arc_start_angle_2 + IM_PI * 0.7f;
+    draw_list->PathClear();
+    draw_list->PathArcTo(center, radius, arc_start_angle_2, arc_end_angle_2, 32);
+    draw_list->PathStroke(color, 0, thickness);
+
+    // 2. 绘制中心脉动的四角星 (FIXED: 修正为绘制8个顶点)
+    const int num_vertices = 8; // 一个四角星有8个顶点 (4个凸点, 4个凹点)
+    ImVec2 points[num_vertices];
+
+    // 定义外半径和内半径，脉动效果作用于外半径
+    float outer_radius = radius * 0.5f * (0.85f + 0.15f * sinf(time * 4.0f));
+    float inner_radius = outer_radius * 0.6f; // 内半径设为外半径的60%，使星星更圆滑
+
+    // 循环4次，每次生成一个凸点和一个凹点
+    for (int i = 0; i < 4; ++i) {
+        // 计算凸点 (tip) 的角度和位置
+        float outer_angle = (i * IM_PI / 2.0f) + (IM_PI / 4.0f); // 45°, 135°, 225°, 315°
+        points[i * 2] = ImVec2(center.x + outer_radius * cosf(outer_angle), 
+                               center.y + outer_radius * sinf(outer_angle));
+
+        // 计算凹点 (valley) 的角度和位置
+        float inner_angle = (i * IM_PI / 2.0f) + (IM_PI / 2.0f); // 90°, 180°, 270°, 360°
+        points[i * 2 + 1] = ImVec2(center.x + inner_radius * cosf(inner_angle), 
+                                   center.y + inner_radius * sinf(inner_angle));
+    }
+    
+    draw_list->AddConvexPolyFilled(points, num_vertices, color);
+}
+void RenderLLMResponseWindow(AppState& app_state) {
+    if (!app_state.show_llm_response_window) return;
+
+    ImGui::SetNextWindowSize(ImVec2(450, 250), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("LLM Response", &app_state.show_llm_response_window)) {
+        
+        if (app_state.status == RequestStatus::SENDING) {
+            // 状态一：正在等待回复，显示加载动画
+            ImVec2 window_size = ImGui::GetWindowSize();
+            ImVec2 spinner_pos( (window_size.x - 60) / 2.0f, (window_size.y - 60) / 2.0f );
+            ImGui::SetCursorPos(spinner_pos);
+            GeminiLoadingSpinner("gemini_spinner", 30.0f, 4.0f, ImGui::GetColorU32(ImGuiCol_Button));
+
+        } else if (app_state.is_generating_response) {
+            // 状态二：收到回复，使用“打字机”效果显示
+            const float chars_per_second = 80.0f;
+            
+            // FIXED: 统一使用 glfwGetTime() 来确保时间计算的准确性
+            double elapsed_time = glfwGetTime() - app_state.typewriter_start_time;
+            
+            size_t chars_to_show = static_cast<size_t>(elapsed_time * chars_per_second);
+            
+            if (chars_to_show >= app_state.llm_response_full_text.length()) {
+                // 打字机效果结束
+                app_state.typewriter_char_index = app_state.llm_response_full_text.length();
+                app_state.is_generating_response = false;
+            } else {
+                app_state.typewriter_char_index = chars_to_show;
+            }
+
+            // 为了避免substr在多字节字符（如中文）上出错，我们只在完全显示时使用完整字符串
+            std::string displayed_text = app_state.is_generating_response 
+                ? app_state.llm_response_full_text.substr(0, app_state.typewriter_char_index)
+                : app_state.llm_response_full_text;
+
+            ImGui::TextWrapped("%s", displayed_text.c_str());
+
+            // 添加一个光标闪烁效果，增强“正在输入”的感觉
+            if(app_state.is_generating_response) {
+                ImGui::SameLine(0.0f, 0.0f);
+                if (fmod(glfwGetTime(), 1.0) < 0.5) {
+                    ImGui::TextUnformatted("_");
+                }
+            }
+
+
+        } else {
+            // 状态三：回复已完全显示
+            ImGui::TextWrapped("%s", app_state.llm_response_full_text.c_str());
+        }
+    }
+    ImGui::End();
+}
 }
 
 // Main code
@@ -492,7 +581,10 @@ int main(int, char**)
     CreateCubeVAO(VAO, VBO, EBO);
 
     Framebuffer viewport_fb; createFramebuffer(viewport_fb, 1, 1);
-    AppState app_state; app_state.log_messages.push_back("[Info] Application started. Waiting for command.");
+    AppState app_state; 
+    app_state.log_messages.push_back("[Info] Application started. Waiting for command.");
+    app_state.llm_response_full_text = "Welcome! I'm ready to help you modify the 3D scene. Please enter a command in the input box below.";
+
 
     // Main loop
     while (!glfwWindowShouldClose(window)) {
@@ -544,16 +636,28 @@ int main(int, char**)
         ImGui::Begin(ICON_FA_CLIPBOARD " LLM Command Log");
         for (const auto& msg : app_state.log_messages) { ImGui::TextUnformatted(msg.c_str()); }
         if (app_state.status == RequestStatus::SENDING) {
-            if (glfwGetTime() - app_state.request_sent_time > 2.0) {
-                 // Simulate a random outcome
-                 if (rand() % 10 < 7) { 
-                    app_state.log_messages.push_back(std::string(ICON_FA_CHECK) + " [Success] LLM responded. Executing: extrude(face=3, height=10).");             
+            if (glfwGetTime() - app_state.request_sent_time > 2.0) { // 模拟2秒等待
+                // 模拟一个随机的成功/失败结果
+                if (rand() % 10 < 7) { 
+                    app_state.log_messages.push_back(std::string(ICON_FA_CHECK) + " [Success] LLM responded. Executing: extrude(face=3, height=10).");
                     ImGui::InsertNotification(ImGuiToast(ImGuiToastType::Success, 3000, ICON_FA_CHECK " Command Succeeded\nThe 3D model was updated."));
-                 } else { 
+                    
+                    // --- 关键逻辑：触发打字机效果 ---
+                    app_state.llm_response_full_text = "Okay, I've processed your request. Here are the steps I'll take:\n\n1.  Identify the top face of the cube.\n2.  Create a vector for the extrusion direction along the Y-axis.\n3.  Apply the extrusion operation to double the height.\n\nExecuting the command now on the 3D model.";
+
+                } else { 
                     app_state.log_messages.push_back(std::string(ICON_FA_TRIANGLE_EXCLAMATION) + " [Error] LLM failed to understand the command.");
                     ImGui::InsertNotification(ImGuiToast(ImGuiToastType::Error, 5000, ICON_FA_TRIANGLE_EXCLAMATION " Command Failed\nPlease rephrase your prompt."));
-                 }
-                 app_state.status = RequestStatus::IDLE;
+                    
+                    // --- 关键逻辑：触发打字机效果 (失败情况) ---
+                    app_state.llm_response_full_text = "I'm sorry, I couldn't understand that request. Could you please try rephrasing it? For example, try being more specific like 'Select the front face of the cube and move it forward by 2 units'.";
+                }
+                
+                // 无论成功或失败，都开始生成回复
+                app_state.status = RequestStatus::IDLE; // 停止主加载状态
+                app_state.is_generating_response = true; // 开始“打字机”状态
+                app_state.typewriter_char_index = 0;
+                app_state.typewriter_start_time = glfwGetTime();
             }
         }
         ImGui::End();
@@ -601,6 +705,8 @@ int main(int, char**)
 
         ImGui::Image((void*)(intptr_t)viewport_fb.textureID, viewport_panel_size, ImVec2(0, 1), ImVec2(1, 0));
         ImGui::End();
+
+        UI::RenderLLMResponseWindow(app_state);
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 5.f); // Optional: Round the notifications
         ImGui::RenderNotifications();
