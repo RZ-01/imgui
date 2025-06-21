@@ -27,7 +27,7 @@
 #if defined(_MSC_VER) && (_MSC_VER >= 1900) && !defined(IMGUI_DISABLE_WIN32_FUNCTIONS)
 #pragma comment(lib, "legacy_stdio_definitions")
 #endif
-
+static ImFont* G_Font_Regular = nullptr;
 static void glfw_error_callback(int error, const char* description)
 {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
@@ -189,6 +189,7 @@ void SetDarkTheme() {
     style.ScrollbarRounding = 8.0f;
     style.GrabRounding      = 8.0f;
     style.TabRounding       = 8.0f;
+    style.PopupRounding    = 8.0f;
 }
 void SetLightTheme(){
     ImGuiStyle& style = ImGui::GetStyle();
@@ -250,6 +251,7 @@ void SetLightTheme(){
     style.ScrollbarRounding = 8.0f;
     style.GrabRounding   = 8.0f;
     style.TabRounding    = 8.0f;
+    style.PopupRounding = 8.0f;
 }
 namespace UI {
 
@@ -336,15 +338,19 @@ void ActionInputBox(AppState& app_state) {
     ImGui::BeginChild("ActionInputContainer", ImVec2(container_width, container_height), false, outer_child_flags);
 
     float text_area_height;
+    float text_area_y_pos;
+    
     if (desired_height <= MIN_HEIGHT) {
         text_area_height = g.FontSize + style.FramePadding.y * 2.0f;
-        ImGui::SetCursorPosY((container_height - text_area_height) / 2.0f);
+        // 让整个TextInputScrollArea在容器中垂直居中
+        text_area_y_pos = (container_height - text_area_height) / 2.0f;
     } else {
         text_area_height = container_height - internal_padding;
-        ImGui::SetCursorPosY(internal_padding / 2.0f);
+        text_area_y_pos = internal_padding / 2.0f;
     }
 
-    ImGui::SetCursorPosX(internal_padding);
+    // 设置TextInputScrollArea的位置（同时设置X和Y）
+    ImGui::SetCursorPos(ImVec2(internal_padding, text_area_y_pos));
 
     // --- 1. 左侧的、可滚动的、隐形的文本区域 ---
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0,0,0,0)); // 透明背景
@@ -354,6 +360,14 @@ void ActionInputBox(AppState& app_state) {
     {
         ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32_BLACK_TRANS); // 输入框本身透明
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f)); // 输入框无内边距
+        
+        // 如果是单行情况，需要垂直居中文本
+        if (desired_height <= MIN_HEIGHT) {
+            // 计算单行文本的垂直居中位置
+            float text_line_height = g.FontSize;
+            float vertical_offset = (text_area_height - text_line_height) / 2.0f;
+            ImGui::SetCursorPosY(vertical_offset);
+        }
         
         // InputTextMultiline填满这个可滚动的子窗口
         ImGui::InputTextMultiline("##Prompt", app_state.prompt_buffer, sizeof(app_state.prompt_buffer), 
@@ -402,16 +416,16 @@ void GeminiLoadingSpinner(const char* id, float radius, float thickness, const I
 
     ImGuiContext& g = *GImGui;
     const ImGuiID im_id = window->GetID(id);
-    const ImVec2 pos = window->DC.CursorPos;
 
-    // 预留绘制空间
-    ImGui::InvisibleButton(id, ImVec2(radius * 2, radius * 2));
-    const ImVec2 center = ImVec2(pos.x + radius, pos.y + radius);
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
+    ImGui::InvisibleButton(id, ImVec2(radius * 2, radius * 2));
+
+    const ImVec2 center = ImVec2(pos.x + radius, pos.y + radius);
     float time = (float)g.Time;
     
-    // 1. 绘制旋转的圆弧 (这部分保持不变)
+    // 绘制旋转的圆弧 (逻辑不变)
     const float arc_start_angle_1 = time * 2.8f;
     const float arc_end_angle_1 = arc_start_angle_1 + IM_PI * 0.7f;
     draw_list->PathClear();
@@ -424,41 +438,38 @@ void GeminiLoadingSpinner(const char* id, float radius, float thickness, const I
     draw_list->PathArcTo(center, radius, arc_start_angle_2, arc_end_angle_2, 32);
     draw_list->PathStroke(color, 0, thickness);
 
-    // 2. 绘制中心脉动的四角星 (FIXED: 修正为绘制8个顶点)
-    const int num_vertices = 8; // 一个四角星有8个顶点 (4个凸点, 4个凹点)
+    // 绘制中心脉动的四角星
+    const int num_vertices = 8;
     ImVec2 points[num_vertices];
-
-    // 定义外半径和内半径，脉动效果作用于外半径
     float outer_radius = radius * 0.5f * (0.85f + 0.15f * sinf(time * 4.0f));
-    float inner_radius = outer_radius * 0.6f; // 内半径设为外半径的60%，使星星更圆滑
 
-    // 循环4次，每次生成一个凸点和一个凹点
+    // --- 关键修改：大幅减小内半径比例，让星星更锐利 ---
+    float inner_radius = outer_radius * 0.7f; 
+
     for (int i = 0; i < 4; ++i) {
-        // 计算凸点 (tip) 的角度和位置
-        float outer_angle = (i * IM_PI / 2.0f) + (IM_PI / 4.0f); // 45°, 135°, 225°, 315°
+        float outer_angle = (i * IM_PI / 2.0f) + (IM_PI / 4.0f);
         points[i * 2] = ImVec2(center.x + outer_radius * cosf(outer_angle), 
                                center.y + outer_radius * sinf(outer_angle));
-
-        // 计算凹点 (valley) 的角度和位置
-        float inner_angle = (i * IM_PI / 2.0f) + (IM_PI / 2.0f); // 90°, 180°, 270°, 360°
+        float inner_angle = (i * IM_PI / 2.0f) + (IM_PI / 2.0f);
         points[i * 2 + 1] = ImVec2(center.x + inner_radius * cosf(inner_angle), 
                                    center.y + inner_radius * sinf(inner_angle));
     }
-    
     draw_list->AddConvexPolyFilled(points, num_vertices, color);
 }
+
 void RenderLLMResponseWindow(AppState& app_state) {
     if (!app_state.show_llm_response_window) return;
 
     ImGui::SetNextWindowSize(ImVec2(450, 250), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("LLM Response", &app_state.show_llm_response_window)) {
-        
         if (app_state.status == RequestStatus::SENDING) {
             // 状态一：正在等待回复，显示加载动画
             ImVec2 window_size = ImGui::GetWindowSize();
+            // 计算一个半径为30px（总尺寸60x60）的动画的居中位置
             ImVec2 spinner_pos( (window_size.x - 60) / 2.0f, (window_size.y - 60) / 2.0f );
             ImGui::SetCursorPos(spinner_pos);
-            GeminiLoadingSpinner("gemini_spinner", 30.0f, 4.0f, ImGui::GetColorU32(ImGuiCol_Button));
+            // 使用之前居中版本的大尺寸参数
+            GeminiLoadingSpinner("gemini_spinner", 40.0f, 4.0f, ImGui::GetColorU32(ImGuiCol_Button));
 
         } else if (app_state.is_generating_response) {
             // 状态二：收到回复，使用“打字机”效果显示
@@ -533,8 +544,15 @@ int main(int, char**)
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
     // Load fonts and icons
-    float baseFontSize = 18.0f;
-    io.Fonts->AddFontFromFileTTF("fonts/Inter-Regular.ttf", baseFontSize);
+    float baseFontSize = 24.0f;
+    
+    // 加载常规字体
+    G_Font_Regular = io.Fonts->AddFontFromFileTTF("fonts/Inter-Regular.ttf", baseFontSize);
+    if (!G_Font_Regular) {
+        // 如果字体文件不存在，使用默认字体
+        G_Font_Regular = io.Fonts->AddFontDefault();
+    }
+    
     ImFontConfig config;
     config.MergeMode = true;
     config.PixelSnapH = true;
@@ -591,8 +609,15 @@ int main(int, char**)
         glfwPollEvents();
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplGlfw_NewFrame(); ImGui::NewFrame();
         if (ImGui::BeginMainMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem(ICON_FA_FILE " New Scene", "Ctrl+N")) { /* Do something */ }
+                if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN " Open Scene", "Ctrl+O")) { /* Do something */ }
+                ImGui::Separator();
+                if (ImGui::MenuItem(ICON_FA_DOOR_OPEN " Exit")) { glfwSetWindowShouldClose(window, true); }
+                ImGui::EndMenu();
+            }
             if (ImGui::BeginMenu("View")) {
-                if (ImGui::MenuItem(is_dark_mode ? ICON_FA_SUN " Dark Mode " : ICON_FA_MOON " Light Mode ")) {
+                if (ImGui::MenuItem(is_dark_mode ? ICON_FA_SUN " Light Mode" : ICON_FA_MOON " Dark Mode")) {
                     is_dark_mode = !is_dark_mode;
                     if (is_dark_mode) {
                         SetDarkTheme();
@@ -602,6 +627,10 @@ int main(int, char**)
                 }
                 ImGui::EndMenu();
             }
+            if (ImGui::BeginMenu("Help")) {
+                if (ImGui::MenuItem(ICON_FA_CIRCLE_INFO " About")) { /* Do something */ }
+                ImGui::EndMenu();
+            }
             ImGui::EndMainMenuBar();
         }
         ImGui::DockSpaceOverViewport(ImGui::GetMainViewport()->ID);
@@ -609,47 +638,21 @@ int main(int, char**)
         // --- UI Panels with new style ---
         ImGui::Begin(ICON_FA_TERMINAL " Controls & Commands");
         UI::ActionInputBox(app_state);
-        
-        /*ImGui::Text("Enter your command for the LLM:");
-        ImGui::InputTextMultiline("##Prompt", app_state.prompt_buffer, sizeof(app_state.prompt_buffer), ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 6));
-
-        if (app_state.status == RequestStatus::SENDING) {
-            // State: Processing - Show disabled button and spinner
-            ImGui::BeginDisabled();
-            UI::GradientButton(ICON_FA_PAPER_PLANE " Send Command");
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            // This is the spinner, it will now be drawn correctly.
-            ImSpinner::SpinnerPulsar("spinner_processing", 12.0f, 3.0f, ImGui::GetColorU32(ImGuiCol_ButtonHovered));
-            ImGui::SameLine(0.0f, 8.0f);
-            ImGui::Text("Processing...");
-        } else {
-            // State: Idle - Show clickable button
-            if (UI::GradientButton(ICON_FA_PAPER_PLANE " Send Command")) {
-                app_state.status = RequestStatus::SENDING;
-                app_state.request_sent_time = glfwGetTime();
-                app_state.log_messages.push_back(std::string(ICON_FA_ARROW_UP) + " [Info] Sending prompt: " + std::string(app_state.prompt_buffer));
-            }
-        }*/
         ImGui::End();
 
         ImGui::Begin(ICON_FA_CLIPBOARD " LLM Command Log");
         for (const auto& msg : app_state.log_messages) { ImGui::TextUnformatted(msg.c_str()); }
         if (app_state.status == RequestStatus::SENDING) {
-            if (glfwGetTime() - app_state.request_sent_time > 2.0) { // 模拟2秒等待
-                // 模拟一个随机的成功/失败结果
+            if (glfwGetTime() - app_state.request_sent_time > 2.0) { 
                 if (rand() % 10 < 7) { 
                     app_state.log_messages.push_back(std::string(ICON_FA_CHECK) + " [Success] LLM responded. Executing: extrude(face=3, height=10).");
                     ImGui::InsertNotification(ImGuiToast(ImGuiToastType::Success, 3000, ICON_FA_CHECK " Command Succeeded\nThe 3D model was updated."));
                     
-                    // --- 关键逻辑：触发打字机效果 ---
                     app_state.llm_response_full_text = "Okay, I've processed your request. Here are the steps I'll take:\n\n1.  Identify the top face of the cube.\n2.  Create a vector for the extrusion direction along the Y-axis.\n3.  Apply the extrusion operation to double the height.\n\nExecuting the command now on the 3D model.";
 
                 } else { 
                     app_state.log_messages.push_back(std::string(ICON_FA_TRIANGLE_EXCLAMATION) + " [Error] LLM failed to understand the command.");
                     ImGui::InsertNotification(ImGuiToast(ImGuiToastType::Error, 5000, ICON_FA_TRIANGLE_EXCLAMATION " Command Failed\nPlease rephrase your prompt."));
-                    
-                    // --- 关键逻辑：触发打字机效果 (失败情况) ---
                     app_state.llm_response_full_text = "I'm sorry, I couldn't understand that request. Could you please try rephrasing it? For example, try being more specific like 'Select the front face of the cube and move it forward by 2 units'.";
                 }
                 
